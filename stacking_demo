@@ -1,0 +1,645 @@
+class HyperStacking():
+    """
+    HyperStacking made by Datacanvas Lab, if u wanna get better performance,you can try complex mode.
+    """
+    def __init__(self, task, estimators,X_train, y_train, reward_score='neg_log_loss',stacking_mode='simple',stacking_trials=10,random_state=None,full_test=False,need_data_transform=True,add_old_features=False):
+        assert len(estimators)>2, print('stacking_model_simple only support when len(estimators) >= 3!')
+        if stacking_mode in 'complex':
+            assert len(estimators)>2, print('stacking_model_complex only support when len(estimators) >= 4!')
+        self._estimators = estimators
+        self._scorer = reward_score
+        self.stacking_mode = stacking_mode
+        self.task=task
+        self.class_= None
+        self.best_score_=None
+        self.random_state = random_state
+        self.cv_nfolds = 0
+        self.test_size = 0.2 ##only for blending complex mode
+        self.full_test = full_test ##only for stack
+        self.mid_modelsPipeline=[] ##only for stacking&complex mode
+        self.mid_modelsPipeline_cv=[] ##only for stacking&complex mode
+        self.need_data_transform = need_data_transform
+        self.add_old_features = add_old_features
+        self.modelsPipeline=None
+        self.modelsPipeline_cv=[]
+        self.stratify = False   ##need to align with hypergbm
+        self.add_diff = False
+        self.fin_models=None
+        self.fin_models_cv=[]
+        self.predict_len_ = None
+        self.search_mode = False
+        self.stacking_score=[] ##record every layer's score,
+        self.models_index =[]  ## only for complex mode
+        self.stacking_trials=stacking_trials ## only for complex mode
+        self.build_model(X_train,y_train)
+        print(self.stacking_score)
+        print(self.mid_modelsPipeline)
+        # self.test_predict_proba(X_train,y_train)
+        # print(self.stacking_score)
+      
+    def fit(self, X, y, est_predictions=None):
+        print('i donot know fit function how to used,why we need fit func')
+
+    def build_model(self,X, y):
+        if self.random_state is None:
+            self.random_state = get_cv_seed()
+        self.cv_nfolds = 0 if self._estimators[0].cv_gbm_models_ is None else len(self._estimators[0].cv_gbm_models_)
+        if hasattr(self._estimators[0], 'classes_'):
+            self.classes_ = self._estimators[0].classes_
+        if self.task in  'binary':
+            self.stratify = True
+        if self.stacking_mode in 'complex' and len(self._estimators) < 8:
+            print('stacking_mode_complex only support max_trials >=8, change stacking_mode to simple')
+            self.stacking_mode='simple'
+        if self.stacking_mode in 'simple':
+            self.modelsPipeline=[estimator for estimator in self._estimators[:5]]
+            if self.cv_nfolds > 1:
+                if self.full_test:
+                    self.fit_model_for_full_test(self.modelsPipeline,X,y,IsFirstLayer=True)
+                next_layer_train, y = self.stack(X,y,self.modelsPipeline,stacking_k=self.cv_nfolds,stratify=self.stratify,seed=self.random_state,add_diff=self.add_diff,need_fit=False,layers_name='layer1')
+                self.stacking_score = self.get_layers_score(next_layer_train,y)
+            else:
+                next_layer_train, y = self.blend(X,y,self.modelsPipeline,test_size=self.test_size,stratify=self.stratify,seed=self.random_state,add_diff=self.add_diff,need_fit=True)
+            if self.task in 'regression':
+                self.fin_models=[LinearRegression(normalize=True),lgb.LGBMRegressor(max_depth=1,verbose=0,silent=True,force_col_wise=True)]
+            else:
+                self.fin_models=[LogisticRegression(max_iter=1000,multi_class='multinomial',solver='lbfgs'),catboost.CatBoostClassifier(depth=1,verbose=False)]
+            if self.cv_nfolds > 1:
+                self.best_score_ = self.get_stacking_score(next_layer_train,y,self.fin_models)
+                if self.full_test:
+                    self.fit_model_for_full_test(self.fin_models,next_layer_train,y)
+                self.stacking_score.append(self.best_score_)
+            else:
+                self.best_score_ = self.get_blending_score(next_layer_train,y,self.fin_models)
+        else:
+            self.search_mode=True
+            self.search_best(X,y)
+            self.search_mode=False
+            if self.cv_nfolds > 1:
+                if self.full_test:
+                    self.fit_model_for_full_test(self.modelsPipeline,X,y,IsFirstLayer=True)
+                next_layer_train, y = self.stack(X,y,self.modelsPipeline,stacking_k=self.cv_nfolds,stratify=self.stratify,seed=self.random_state,add_diff=self.add_diff,need_fit=False,layers_name='layer1')
+                if not self.add_old_features:
+                    self.stacking_score.append(self.get_layers_score(next_layer_train,y))
+                next_layer_train= self.handle_midLayers_models(next_layer_train,y)
+                if self.add_old_features:
+                    self.stacking_score = self.get_layers_score(next_layer_train,y)
+                self.best_score_ = self.get_stacking_score(next_layer_train,y,self.fin_models)
+                if self.full_test:
+                    self.fit_model_for_full_test(self.fin_models,next_layer_train,y)
+                self.stacking_score.append(self.best_score_)
+            else:
+                next_layer_train, y = self.blend(X,y,self.modelsPipeline,stratify=self.stratify,seed=self.random_state,add_diff=self.add_diff,test_size=self.test_size)
+                self.best_score_ = self.get_blending_score(next_layer_train,y,self.fin_models)
+    def predict(self,X_train):
+        return self.proba2predict(self.predict_proba(X_train))
+
+
+    def predict_proba(self,X_test):
+        ###here i think we have two type func
+        _used_model_len=len(self.modelsPipeline)
+        _layerF_dataset=np.zeros((X_test.shape[0],self.predict_len_*_used_model_len))
+        predict_means=[]
+        if self.cv_nfolds > 1:
+            if self.full_test:
+                for i,model in enumerate(self.modelsPipeline):
+                    _begin_i = i*self.predict_len_ % (_used_model_len*self.predict_len_)
+                    _end_i = _begin_i + self.predict_len_
+                    transform_data_index = i % len(self.modelsPipeline)
+                    X_test_ = X_test
+                    if self.need_data_transform:
+                        X_test_= self.modelsPipeline[transform_data_index].transform_data(X_test)
+                    _layerF_dataset[:,_begin_i:_end_i]+=self.reshape_1d(self.model_predict(model.gbm_model,X_test=X_test_,need_fit=False))
+            else:
+                for i,model in enumerate(self.modelsPipeline_cv):
+                    _begin_i = i*self.predict_len_ % (_used_model_len*self.predict_len_)
+                    _end_i = _begin_i + self.predict_len_
+                    transform_data_index = i % len(self.modelsPipeline)
+                    X_test_ = X_test
+                    if self.need_data_transform:
+                        X_test_= self.modelsPipeline[transform_data_index].transform_data(X_test)
+                    _layerF_dataset[:,_begin_i:_end_i]+=self.reshape_1d(self.model_predict(model,X_test=X_test_,need_fit=False))
+                _layerF_dataset/=self.cv_nfolds
+
+            _columns = []
+            for i in range(_used_model_len):
+                if self.predict_len_ == 1:
+                    _columns.append(f'layer1_model{i+1}')
+                else:
+                    for j in range(self.predict_len_):
+                        _columns.append(f'layer1_model{i+1}_{j}')
+            _layerF_dataset = pd.DataFrame(_layerF_dataset, columns=_columns)
+            if self.add_diff:
+                _layerF_dataset = self.feature_combiner(_layerF_dataset,_layerF_dataset.shape[1])
+            if self.add_old_features:
+                _columns = list(X_test_.columns)+list(_layerF_dataset.columns)
+                _layerF_dataset = pd.DataFrame(np.hstack((self._estimators[0].transform_data(X_test),_layerF_dataset)),columns=_columns)
+            _layerF_dataset = self.handle_midLayers_models(_layerF_dataset,predict_mode=True)
+            if self.full_test:
+                for i,model in enumerate(self.fin_models):
+                    predict_means.append(self.reshape_1d(self.model_predict(model,X_test=_layerF_dataset,need_fit=False,need_binary_simple=False)))
+            else:
+                for i,model in enumerate(self.fin_models_cv):
+                    predict_means.append(self.reshape_1d(self.model_predict(model,X_test=_layerF_dataset,need_fit=False,need_binary_simple=False)))
+            predict_means=self.reshape_1d(np.mean(predict_means,axis=0))
+        else:
+            for i,model in enumerate(self.modelsPipeline):
+                _begin_i = i*self.predict_len_ % (_used_model_len*self.predict_len_)
+                _end_i = _begin_i + self.predict_len_
+                transform_data_index = i % len(self.modelsPipeline)
+                X_test_ = X_test
+                if self.need_data_transform:
+                    X_test_= self.modelsPipeline[transform_data_index].transform_data(X_test)
+                _layerF_dataset[:,_begin_i:_end_i]+=self.reshape_1d(self.model_predict(model,X_test=X_test_,need_fit=False))
+            if self.add_diff:
+                _columns = []
+                for i in range(_used_model_len):
+                    if self.predict_len_ == 1:
+                      _columns.append(f'model{i+1}')
+                    else:
+                        for j in range(self.predict_len_):
+                            _columns.append(f'model{i+1}_{j}')
+                _layerF_dataset = pd.DataFrame(_layerF_dataset, columns=_columns)
+                _layerF_dataset = self.feature_combiner(_layerF_dataset,_layerF_dataset.shape[1]).values
+            if self.add_old_features:
+                _layerF_dataset = np.hstack((self._estimators[0].transform_data(X_test),_layerF_dataset))
+            for i,model in enumerate(self.fin_models):
+                predict_means.append(self.reshape_1d(self.model_predict(model,X_test=_layerF_dataset,need_fit=False,need_binary_simple=False)))
+            predict_means=self.reshape_1d(np.mean(predict_means,axis=0))
+        return predict_means
+    
+    def test_predict_proba(self,X_test,y):
+        ###here i think we have two type func
+        _used_model_len=len(self.modelsPipeline)
+        _layerF_dataset=np.zeros((X_test.shape[0],self.predict_len_*_used_model_len))
+        predict_means=[]
+        if self.cv_nfolds > 1:
+            if self.full_test:
+                for i,model in enumerate(self.modelsPipeline):
+                    _begin_i = i*self.predict_len_ % (_used_model_len*self.predict_len_)
+                    _end_i = _begin_i + self.predict_len_
+                    transform_data_index = i % len(self.modelsPipeline)
+                    X_test_ = X_test
+                    if self.need_data_transform:
+                        X_test_= self.modelsPipeline[transform_data_index].transform_data(X_test)
+                    _layerF_dataset[:,_begin_i:_end_i]+=self.reshape_1d(self.model_predict(model.gbm_model,X_test=X_test_,need_fit=False))
+            else:
+                for i,model in enumerate(self.modelsPipeline_cv):
+                    _begin_i = i*self.predict_len_ % (_used_model_len*self.predict_len_)
+                    _end_i = _begin_i + self.predict_len_
+                    transform_data_index = i % len(self.modelsPipeline)
+                    X_test_ = X_test
+                    if self.need_data_transform:
+                        X_test_= self.modelsPipeline[transform_data_index].transform_data(X_test)
+                    _layerF_dataset[:,_begin_i:_end_i]+=self.reshape_1d(self.model_predict(model,X_test=X_test_,need_fit=False))
+                _layerF_dataset/=self.cv_nfolds
+
+            _columns = []
+            for i in range(_used_model_len):
+                if self.predict_len_ == 1:
+                    _columns.append(f'layer1_model{i+1}')
+                else:
+                    for j in range(self.predict_len_):
+                        _columns.append(f'layer1_model{i+1}_{j}')
+            _layerF_dataset = pd.DataFrame(_layerF_dataset, columns=_columns)
+            if self.add_diff:
+                _layerF_dataset = self.feature_combiner(_layerF_dataset,_layerF_dataset.shape[1])
+            if self.add_old_features:
+                _columns = list(X_test_.columns)+list(_layerF_dataset.columns)
+                _layerF_dataset = pd.DataFrame(np.hstack((self._estimators[0].transform_data(X_test),_layerF_dataset)),columns=_columns)
+            self.stacking_score=[]
+            if not self.add_old_features:
+                self.stacking_score.append(self.get_layers_score(_layerF_dataset,y))
+            _layerF_dataset = self.handle_midLayers_models(_layerF_dataset,y=y,predict_mode=True,test_predict_mode=True)
+            if self.add_old_features:
+                self.stacking_score.append(self.get_layers_score(_layerF_dataset,y))
+            if self.full_test:
+                for i,model in enumerate(self.fin_models):
+                    predict_means.append(self.reshape_1d(self.model_predict(model,X_test=_layerF_dataset,need_fit=False,need_binary_simple=False)))
+            else:
+                for i,model in enumerate(self.fin_models_cv):
+                    predict_means.append(self.reshape_1d(self.model_predict(model,X_test=_layerF_dataset,need_fit=False,need_binary_simple=False)))
+            predict_means=self.reshape_1d(np.mean(predict_means,axis=0))
+            self.stacking_score.append(self.get_score_by_scorer(y,predict_means))
+        else:
+            for i,model in enumerate(self.modelsPipeline):
+                _begin_i = i*self.predict_len_ % (_used_model_len*self.predict_len_)
+                _end_i = _begin_i + self.predict_len_
+                transform_data_index = i % len(self.modelsPipeline)
+                X_test_ = X_test
+                if self.need_data_transform:
+                    X_test_= self.modelsPipeline[transform_data_index].transform_data(X_test)
+                _layerF_dataset[:,_begin_i:_end_i]+=self.reshape_1d(self.model_predict(model,X_test=X_test_,need_fit=False))
+            if self.add_diff:
+                _columns = []
+                for i in range(_used_model_len):
+                    if self.predict_len_ == 1:
+                      _columns.append(f'model{i+1}')
+                    else:
+                        for j in range(self.predict_len_):
+                            _columns.append(f'model{i+1}_{j}')
+                _layerF_dataset = pd.DataFrame(_layerF_dataset, columns=_columns)
+                _layerF_dataset = self.feature_combiner(_layerF_dataset,_layerF_dataset.shape[1]).values
+            if self.add_old_features:
+                _layerF_dataset = np.hstack((self._estimators[0].transform_data(X_test),_layerF_dataset))
+            for i,model in enumerate(self.fin_models):
+                predict_means.append(self.reshape_1d(self.model_predict(model,X_test=_layerF_dataset,need_fit=False,need_binary_simple=False)))
+            predict_means=self.reshape_1d(np.mean(predict_means,axis=0))
+        return predict_means
+
+    
+    def get_layers_score(self,X,y):
+        ##目前还没有实现多分类任务下的操作
+        if self.add_old_features:
+            _columns = list(X.columns)
+            _columns = [item for item in _columns if 'layer'  in item and  '-' not in item]
+            layer_score = []
+            stacking_score=[]
+            if self.predict_len_ == 1:
+                for col in _columns:
+                    _score = self.get_score_by_scorer(y,X[col])
+                    layer_score.append(_score)
+                stacking_score.append(layer_score[:len(self.modelsPipeline)])
+                if len(self.mid_modelsPipeline):
+                    layer_score=layer_score[len(self.modelsPipeline):]
+                    layers_index=[len(mid_layer) for mid_layer in self.mid_modelsPipeline]
+                    for i in layers_index:
+                        stacking_score.append(layer_score[:i])
+                        layer_score=layer_score[i:]
+            else:
+                for i in range(0,len(_columns),self.predict_len_):
+                    _score = self.get_score_by_scorer(y,X[_columns[i:i+self.predict_len_]])
+                    layer_score.append(_score)
+                stacking_score.append(layer_score[:len(self.modelsPipeline)])
+                if len(self.mid_modelsPipeline):
+                    layer_score=layer_score[len(self.modelsPipeline):]
+                    layers_index=[len(mid_layer) for mid_layer in self.mid_modelsPipeline]
+                    for i in layers_index:
+                        stacking_score.append(layer_score[:i])
+                        layer_score=layer_score[i:]
+            return stacking_score
+        else:
+            _columns = list(X.columns)
+            _columns = [item for item in _columns if 'layer'  in item and  '-' not in item]
+            layer_score = []   ##多分类这里肯定不只是一列
+            if self.predict_len_ == 1:
+                for col in _columns:   
+                    _score = self.get_score_by_scorer(y,X[col])
+                    layer_score.append(_score)
+            else:
+                for i in range(0,len(_columns),self.predict_len_):
+                    _score = self.get_score_by_scorer(y,X[_columns[i:i+self.predict_len_]])
+                    layer_score.append(_score)
+            return layer_score
+
+    def reduce_class_size(self):
+        self._estimators=None
+        self.models_index=None
+        if self.cv_nfolds > 1 and self.full_test is False:
+            self.modelsPipeline=None
+            self.mid_modelsPipeline=None
+            self.fin_models=None
+        else:
+            self.modelsPipeline_cv=None
+            self.mid_modelsPipeline_cv=None
+            self.fin_models_cv=None
+
+    def handle_midLayers_models(self,X,y=None,predict_mode=False,test_predict_mode=False):
+        if len(self.mid_modelsPipeline) == 0:
+            return X
+        next_layer_train=deepcopy(X)
+        if self.full_test:
+            if predict_mode:
+                for i,layers_model in enumerate(self.mid_modelsPipeline):
+                    _used_model_len=len(layers_model)
+                    layers_dataset=np.zeros((next_layer_train.shape[0],self.predict_len_*_used_model_len))
+                    for j,model in enumerate(layers_model):
+                        _begin_i = j*self.predict_len_ % (_used_model_len*self.predict_len_)
+                        _end_i = _begin_i + self.predict_len_
+                        layers_dataset[:,_begin_i:_end_i]+=self.reshape_1d(self.model_predict(model,X_test=next_layer_train,need_fit=False))
+                    _columns = []
+                    for k in range(_used_model_len):
+                        if self.predict_len_ == 1:
+                            _columns.append(f'layer{i+2}_model{k+1}')
+                        else:
+                            for j in range(self.predict_len_):
+                                _columns.append(f'layer{i+2}_model{k+1}_{j}')
+                    layers_dataset = pd.DataFrame(layers_dataset, columns=_columns)
+                    if self.add_diff:
+                        layers_dataset = self.feature_combiner(layers_dataset,layers_dataset.shape[1])
+                    if self.add_old_features:
+                        _columns = list(next_layer_train.columns)+list(layers_dataset.columns)
+                        layers_dataset = pd.DataFrame(np.hstack((next_layer_train,layers_dataset)),columns=_columns)
+                    next_layer_train= layers_dataset
+                    if test_predict_mode:
+                        if not self.add_old_features:
+                            self.stacking_score.append(self.get_layers_score(next_layer_train,y))
+            else:
+                for i,layers_model in enumerate(self.mid_modelsPipeline):
+                    self.fit_model_for_full_test(layers_model,next_layer_train,y)
+                    next_layer_train, y = self.stack(next_layer_train, y, layers_model,stacking_k=self.cv_nfolds,stratify=self.stratify,seed=self.random_state,add_diff=self.add_diff,need_fit=True,mid_layers_mode=True,layers_name=f'layer{i+2}')
+                    if not self.add_old_features:
+                        self.stacking_score.append(self.get_layers_score(next_layer_train,y))
+                print('handle mid_layers_model done')
+        else:
+            if predict_mode:
+                for i,layers_model in enumerate(self.mid_modelsPipeline_cv):
+                    _used_model_len=int(len(layers_model) / self.cv_nfolds)
+                    layers_dataset=np.zeros((next_layer_train.shape[0],self.predict_len_*_used_model_len))
+                    for j,model in enumerate(layers_model):
+                        _begin_i = j*self.predict_len_ % (_used_model_len*self.predict_len_)
+                        _end_i = _begin_i + self.predict_len_
+                        layers_dataset[:,_begin_i:_end_i]+=self.reshape_1d(self.model_predict(model,X_test=next_layer_train,need_fit=False))
+                    layers_dataset/=self.cv_nfolds
+                    _columns = []
+                    for k in range(_used_model_len):
+                        if self.predict_len_ == 1:
+                            _columns.append(f'layer{i+2}_model{k+1}')
+                        else:
+                            for j in range(self.predict_len_):
+                                _columns.append(f'layer{i+2}_model{k+1}_{j}')
+                    layers_dataset = pd.DataFrame(layers_dataset, columns=_columns)
+                    if self.add_diff:
+                        layers_dataset = self.feature_combiner(layers_dataset,layers_dataset.shape[1])
+                    if self.add_old_features:
+                        _columns = list(next_layer_train.columns)+list(layers_dataset.columns)
+                        layers_dataset = pd.DataFrame(np.hstack((next_layer_train,layers_dataset)),columns=_columns)
+                    next_layer_train= layers_dataset
+                    if test_predict_mode:
+                        if not self.add_old_features:
+                            self.stacking_score.append(self.get_layers_score(next_layer_train,y))
+                    
+            else:
+                for i,layers_model in enumerate(self.mid_modelsPipeline):
+                    next_layer_train, y = self.stack(next_layer_train, y, layers_model,stacking_k=self.cv_nfolds,stratify=self.stratify,seed=self.random_state,add_diff=self.add_diff,need_fit=True,mid_layers_mode=True,layers_name=f'layer{i+2}')
+                    if not self.add_old_features:
+                        self.stacking_score.append(self.get_layers_score(next_layer_train,y))
+                    cur_cv_models = self.mid_modelsPipeline_cv[i:]
+                    self.mid_modelsPipeline_cv=self.mid_modelsPipeline_cv[:i]
+                    self.mid_modelsPipeline_cv.append(cur_cv_models)
+                print('handle mid_layers_model done')
+        return next_layer_train
+    def fit_model_for_full_test(self,modelspipeline,X,y,IsFirstLayer=False):
+        for model in modelspipeline:
+            if IsFirstLayer:
+                model.gbm_model.fit(model.transform_data(X),y)
+            else:
+                model.fit(X,y)
+
+    def get_predict_len(self):
+        _len = 1
+        if self.task in 'multiclass':
+           _len = len(self.classes_)
+        return _len
+
+
+    def reshape_1d(self,df):
+        """If parameter is 1D row vector then convert it into 2D matrix."""
+        shape = df.shape
+        if len(shape) == 1:
+            return df.reshape(shape[0], 1)
+        else:
+            return df
+    def generate_columns(self,df, name):
+        if len(df.shape) == 1:
+            col_count = 1
+        else:
+            col_count = df.shape[1]
+        if col_count == 1:
+            return [name]
+        else:
+            return ['%s_%s' % (name, i) for i in range(col_count)]
+    def feature_combiner(self,df,need_len=0):
+        need_colums = df.columns[-need_len:]
+        
+        combs = list(combinations(need_colums, 2))
+        for i, j in combs:
+            column_name = '%s-%s' % (i, j)
+            df[column_name] = df[i] - df[j]
+        return df
+
+    def kfold(self,X,y, k=5, stratify=False, shuffle=True,seed=33):
+        if stratify:
+            kf = StratifiedKFold(n_splits=k, random_state=seed, shuffle=shuffle)
+        else:
+            kf = KFold(n_splits=k, random_state=seed, shuffle=shuffle)
+        for train_index, test_index in kf.split(X, y):
+            X_train,y_train= X.iloc[train_index], y.iloc[train_index]
+            X_test,y_test= X.iloc[test_index],y.iloc[test_index]
+            yield X_train, y_train, X_test, y_test, train_index, test_index
+    def Hdeepcopy(self,model):
+        if  hasattr(model, 'booster_'):
+            copy_model = lgb.LGBMRegressor(**model.booster_.params) if  'regression' in self.task else lgb.LGBMClassifier(**model.booster_.params)
+        else:
+            copy_model = deepcopy(model)
+        return copy_model
+    def model_predict(self,model,X_train=None,y_train=None,X_test=None,need_fit=True,need_binary_simple=True):
+        if need_fit:
+            model.fit(X_train,y_train)
+     
+        if self.task in 'regression':
+            predict_proba = model.predict(X_test)
+        else:
+            predict_proba =  model.predict_proba(X_test)
+            if self.task in 'binary':
+                if need_binary_simple:
+                    predict_proba = predict_proba[:, 1]
+        return predict_proba
+
+    def stack(self,X,y,modelsPipeline,stacking_k=5, stratify=False, seed=33, add_diff=False,need_fit=True,mid_layers_mode=False,layers_name=''):
+        ##for get lens of predict]
+        if self.predict_len_ is None:
+            self.predict_len_ = self.get_predict_len()
+        new_X = np.zeros((len(modelsPipeline), X.shape[0],self.predict_len_))
+        result_x= []
+        for i, fold in enumerate(self.kfold(X, y,stacking_k, stratify=stratify, seed=seed, shuffle=True)):
+            X_train, y_train, X_test, y_test, train_index, test_index = fold
+            for j, model in enumerate(modelsPipeline):
+                X_test_ = X_test
+                if self.need_data_transform and mid_layers_mode is False:
+                    X_test_ = model.transform_data(X_test)
+                if not self.search_mode:
+                    if mid_layers_mode:
+                        if not self.full_test:
+                            dst_model = self.Hdeepcopy(model)
+                            prediction = self.reshape_1d(self.model_predict(dst_model,X_train,y_train,X_test_,need_fit=need_fit))
+                            self.mid_modelsPipeline_cv.append(dst_model)
+                        else:
+                            dst_model = self.Hdeepcopy(model)
+                            prediction = self.reshape_1d(self.model_predict(dst_model,X_train,y_train,X_test_,need_fit=need_fit))
+                    else:
+                        prediction = self.reshape_1d(self.model_predict(model.cv_gbm_models_[i],X_test=X_test_,need_fit=need_fit))
+                        if not self.full_test:
+                            self.modelsPipeline_cv.append(model.cv_gbm_models_[i])
+                else:
+                    if mid_layers_mode:
+                        prediction = self.reshape_1d(self.model_predict(model,X_train,y_train,X_test_,need_fit=need_fit))
+                    else:
+                        prediction = self.reshape_1d(self.model_predict(model.cv_gbm_models_[i],X_test=X_test_,need_fit=need_fit))
+                new_X[j,test_index] = prediction
+        for j,_new_x in enumerate(new_X):
+            train_df = pd.DataFrame(_new_x, columns=self.generate_columns(_new_x, f'{layers_name}_model{j+1}'))
+            result_x.append(train_df)
+        result_x = pd.concat(result_x, axis=1)
+        if add_diff:
+            result_x = self.feature_combiner(result_x,result_x.shape[1])
+        if self.add_old_features:
+            _columns = list(X.columns)+list(result_x.columns)
+            if mid_layers_mode:
+                result_x = pd.DataFrame(np.hstack((X,result_x)),columns=_columns)
+            else:
+                result_x = pd.DataFrame(np.hstack((self._estimators[0].transform_data(X),result_x)),columns=_columns)
+        return result_x,y
+    def blend(self,X,y,modelsPipeline,test_size=0.2,stratify=True, shuffle=True, seed=33, add_diff=False,need_fit=True):
+        ##for get lens of predict]
+        if self.predict_len_ is None:
+            self.predict_len_ = self.get_predict_len()
+        result_x= []
+        X_train,X_test,y_train,y_test = train_test_split(X,y,stratify=y,test_size=test_size,random_state=seed)
+        new_X = np.zeros((len(modelsPipeline), X_test.shape[0], self.predict_len_))
+        for j, model in enumerate(modelsPipeline):
+            X_train_ = X_train
+            X_test_ = X_test
+            if self.need_data_transform:
+                X_train_ = model.transform_data(X_train)
+                X_test_ = model.transform_data(X_test)                
+            prediction = self.reshape_1d(self.model_predict(model.gbm_model,X_train_, y_train, X_test_,need_fit=True))
+            new_X[j] = prediction
+        for j,_new_x in enumerate(new_X):
+            train_df = pd.DataFrame(_new_x, columns=self.generate_columns(_new_x, f'model{j+1}'))
+            result_x.append(train_df)
+        result_x = pd.concat(result_x, axis=1)
+        if add_diff:
+            result_x = self.feature_combiner(result_x,result_x.shape[1])
+        if self.add_old_features:
+            _columns = list(X_test.columns)+list(result_x.columns)
+            result_x = pd.DataFrame(np.hstack((X_test,result_x)),columns=_columns)
+        return result_x,y_test
+
+    def get_score_by_scorer(self,y_true,predict_mean):
+        if isinstance(self._scorer, _PredictScorer) and self.classes_ is not None and len(self.classes_) > 0:
+            if predict_mean.shape[1]>1:
+                predict_mean = np.array(self.classes_).take(np.argmax(predict_mean, axis=1), axis=0)
+            else:
+                predict_mean = (predict_mean > 0.5).astype('int32')     
+        elif self.task == 'binary' and  len(predict_mean.shape)>1:
+            predict_mean = predict_mean[:, 1]
+        else:
+            pass
+        score = self._scorer._score_func(y_true, predict_mean, **self._scorer._kwargs)
+        return score
+        
+    def get_stacking_score(self,X,y,modelsPipeline,k=3):
+        if self.task == 'binary':
+            result_predict_mean = np.zeros((len(modelsPipeline), X.shape[0], 2)) 
+        else:
+            result_predict_mean = np.zeros((len(modelsPipeline), X.shape[0], self.predict_len_))
+        for i, fold in enumerate(self.kfold(X, y, k, stratify=self.stratify, seed=self.random_state, shuffle=True)):
+            X_train, y_train, X_test, y_test, train_index, test_index = fold
+            for j, model in enumerate(modelsPipeline):
+                if not self.search_mode:
+                    dst_model=self.Hdeepcopy(model)
+                    prediction = self.reshape_1d(self.model_predict(dst_model,X_train, y_train, X_test,need_binary_simple=False))
+                    self.fin_models_cv.append(dst_model)
+                else:
+                    prediction = self.reshape_1d(self.model_predict(model,X_train, y_train, X_test,need_binary_simple=False))
+                result_predict_mean[j,test_index] = prediction
+        result_predict_mean=np.mean(result_predict_mean,axis=0)
+        score=self.get_score_by_scorer(y,result_predict_mean)
+        return score   
+
+    def get_blending_score(self,X,y,modelsPipeline):
+        if self.task == 'binary':
+            result_predict_mean = np.zeros((len(modelsPipeline), X.shape[0], 2)) 
+        else:
+            result_predict_mean = np.zeros((len(modelsPipeline), X.shape[0], self.predict_len_))
+        for j, model in enumerate(modelsPipeline):
+            prediction = self.reshape_1d(self.model_predict(model,X, y, X,need_binary_simple=False))
+            result_predict_mean[j] = prediction
+        result_predict_mean=np.mean(result_predict_mean,axis=0)
+        score=self.get_score_by_scorer(y,result_predict_mean)
+        return score       
+    
+    def search_best(self, X, y):
+        from hypernets.utils.param_tuning import search_params
+        def search_best_stacking_params(
+                                            X=None, y=None,
+                                            used_models=Choice([3,4,5,6,7]),
+                                            add_diff=Bool(),
+                                            model_random=Bool(),
+                                            test_size=Choice([0.1,0.2,0.3]),
+                                            # add_layers=Choice([1,2,3,4]),
+                                            add_layers=Choice([1,1]),
+                                            layers_2_models=Choice([[0,1],[0,2],[1,2],[0,1,2]]),
+                                            layers_2_depth=Choice([1,2]),
+                                            layers_3_models=Choice([[0,1],[0,2],[1,2],[0,1,2]]),
+                                            layers_3_depth=Choice([1,2]),
+                                            layers_4_models=Choice([[0,1],[0,2],[1,2],[0,1,2]]),
+                                            layers_4_depth=Choice([1,2]),
+                                            helpI = Int(0,100,step=1),
+                                        ):
+            if model_random:
+                models_index = random.sample(range(len(self._estimators)),used_models)
+            else:
+                models_index =[i for i in range(used_models)]
+            _params_out = f'stacking info: add_diff:{add_diff}, stratify:{self.stratify}, models_index:{models_index}, add_layers:{add_layers}, add_old_features:{self.add_old_features}'
+            print(_params_out)
+            self.models_index.append(models_index)
+            modelsPipeline = [self._estimators[models_index[i]] for i in range(used_models)]
+            if self.cv_nfolds > 1:
+                next_layer_train = deepcopy(X)
+                mid_modelsPipeline=[]
+                for i in range(add_layers):
+                    if i == 0:
+                        next_layer_train, y = self.stack(next_layer_train, y, modelsPipeline,stacking_k=self.cv_nfolds,stratify=self.stratify,seed=self.random_state,add_diff=add_diff,need_fit=False,layers_name=f'layers{i+1}')
+                    else:
+                        names = locals()
+                        if self.task in 'regression':
+                            _add_layers_models = [LinearRegression(normalize=True), lgb.LGBMRegressor(max_depth=names[f'layers_{i+1}_depth'],verbose=-1),
+                                                  catboost.CatBoostRegressor(depth=names[f'layers_{i+1}_depth'], verbose=False)]
+                            _add_layers_models = [_add_layers_models[k] for k in names[f'layers_{i+1}_models']]
+                        else:
+                            _add_layers_models = [LogisticRegression(max_iter=1000,multi_class='multinomial',solver='lbfgs'), lgb.LGBMClassifier(max_depth=names[f'layers_{i+1}_depth'],verbose=-1),
+                                                  catboost.CatBoostClassifier(depth=names[f'layers_{i+1}_depth'], verbose=False)]
+                            _add_layers_models = [_add_layers_models[k] for k in names[f'layers_{i+1}_models']]
+                        next_layer_train, y = self.stack(next_layer_train, y, _add_layers_models,stacking_k=self.cv_nfolds,stratify=self.stratify,seed=self.random_state,add_diff=add_diff,need_fit=True,
+                                              mid_layers_mode=True,layers_name=f'layers{i+1}')
+                        mid_modelsPipeline.append(_add_layers_models)
+                self.mid_modelsPipeline.append(mid_modelsPipeline)
+                if self.fin_models is not None:
+                    pass
+                else:
+                    if self.task in 'regression':
+                        self.fin_models=[LinearRegression(normalize=True),lgb.LGBMRegressor(max_depth=1,verbose=0,silent=True,force_col_wise=True)]
+                    else:
+                        self.fin_models=[LogisticRegression(max_iter=1000,multi_class='multinomial',solver='lbfgs'),catboost.CatBoostClassifier(depth=1,verbose=False)]
+
+                score = self.get_stacking_score(next_layer_train,y,self.fin_models)
+            else:
+                next_layer_train, y = self.blend(X, y, modelsPipeline,test_size=test_size,stratify=self.stratify,seed=self.random_state,add_diff=add_diff,need_fit=True)
+                if self.fin_models is not None:
+                    pass
+                else:
+                    if self.task in 'regression':
+                        self.fin_models=[LinearRegression(normalize=True),lgb.LGBMRegressor(max_depth=1,verbose=0,silent=True,force_col_wise=True)]
+                    else:
+                        self.fin_models=[LogisticRegression(max_iter=1000,multi_class='multinomial',solver='lbfgs'),catboost.CatBoostClassifier(depth=1,verbose=False)]
+                score = self.get_blending_score(next_layer_train,y,self.fin_models)
+            return score
+
+        _optimize_direction = 'min' if self._scorer._sign == -1 else 'max'
+        history = search_params(search_best_stacking_params, 'random', max_trials=self.stacking_trials, optimize_direction=_optimize_direction,X=X, y=y)
+        best_params = history.get_best().space_sample.vectors
+        best_no = history.get_best().trial_no
+        self.add_diff = [False,True][best_params[1]]
+        self.test_size = [0.1,0.2,0.3][best_params[3]]
+        self.modelsPipeline=[self._estimators[i] for i in self.models_index[best_no-1]]
+        if self.cv_nfolds > 1:
+            self.mid_modelsPipeline=self.mid_modelsPipeline[best_no-1]
+
+    def proba2predict(self, proba):
+        assert len(proba.shape) <= 2
+        if self.task == 'regression':
+            return proba
+        pred = np.array(self.classes_).take(np.argmax(proba, axis=1), axis=0)
+        return pred
